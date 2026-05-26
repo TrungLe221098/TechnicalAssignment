@@ -1,8 +1,9 @@
 import base64
 import json
 import os
+import time
 import redis
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import tuple_
 from sqlalchemy.orm import Session
@@ -71,6 +72,56 @@ app.add_middleware(
 )
 
 
+# ── rate limiting (sliding window counter) ────────────────────────────────────
+RATE_LIMIT_WINDOW = 60   # window size in seconds
+RATE_LIMIT_MAX    = 60   # max requests allowed per window per client
+
+def is_rate_limited(client_id: str) -> bool:
+    """
+    Sliding Window Counter using Redis.
+
+    Splits time into fixed windows of RATE_LIMIT_WINDOW seconds.
+    The effective count is a weighted blend of the previous window's count
+    and the current window's count, proportional to how far we are into
+    the current window:
+
+        weighted = prev_count * (1 - elapsed_fraction) + current_count
+
+    This smooths the hard boundary of a plain fixed-window counter while
+    keeping only two O(1) Redis keys per client.
+
+    Returns True if the request should be rejected (rate limit exceeded).
+    """
+    now            = time.time()
+    current_window = int(now // RATE_LIMIT_WINDOW)
+    prev_window    = current_window - 1
+    elapsed_frac   = (now % RATE_LIMIT_WINDOW) / RATE_LIMIT_WINDOW
+
+    current_key = f"rl:{client_id}:{current_window}"
+    prev_key    = f"rl:{client_id}:{prev_window}"
+
+    # Fetch both counters in a single round-trip
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.get(prev_key)
+    pipe.get(current_key)
+    prev_raw, current_raw = pipe.execute()
+
+    prev_count    = int(prev_raw    or 0)
+    current_count = int(current_raw or 0)
+
+    weighted = prev_count * (1 - elapsed_frac) + current_count
+    if weighted >= RATE_LIMIT_MAX:
+        return True
+
+    # Increment current window; TTL = 2 windows so previous key stays readable
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.incr(current_key)
+    pipe.expire(current_key, RATE_LIMIT_WINDOW * 2)
+    pipe.execute()
+
+    return False
+
+
 # ── cache helpers ─────────────────────────────────────────────────────────────
 CACHE_TTL = 60  # seconds
 
@@ -102,6 +153,7 @@ async def startup():
 # ── endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/api/employees", response_model=schemas.CursorPage)
 def get_employees(
+    request: Request,
     name: Optional[str] = Query(None, description="Partial match on first or last name"),
     location: Optional[str] = Query(None),
     company: Optional[str] = Query(None),
@@ -112,6 +164,15 @@ def get_employees(
     page_size: int = Query(10, ge=1, le=100, description="Items per page"),
     db: Session = Depends(get_db),
 ):
+    # ── rate limit ────────────────────────────────────────────────────────────
+    try:
+        if is_rate_limited(request.client.host):
+            raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis unavailable — allow request through
+
     cache_key = make_cache_key(
         name=name, location=location, company=company,
         department=department, position=position, status=status,
