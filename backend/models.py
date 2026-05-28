@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Index, Integer, String
 from database import Base
 
 
@@ -14,3 +14,7 @@ class Employee(Base):
     department = Column(String) # HR | Engineering | Finance | Marketing | Operations
     position = Column(String)   # Director | Manager | Senior Engineer | Analyst | Junior Engineer
     status = Column(String)     # Active | Not Started | Terminated
+
+    __table_args__ = (
+        Index("ix_employees_first_name_last_name", "first_name", "last_name"),
+    )
